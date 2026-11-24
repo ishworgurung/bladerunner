@@ -1,0 +1,6 @@
+# Parse the BPF sources as C (not C++) with the same flags as `make bpf`.
+# Without this, clangd treats bladerunner_common.h as C++ and flags the field named `class`.
+If:
+  PathMatch: bpf/.*\.(h|c)
+CompileFlags:
+  Add: [-xc, -std=gnu11, -target, bpf, -D__TARGET_ARCH_x86, -I/usr/include/x86_64-linux-gnu, -Ibpf]

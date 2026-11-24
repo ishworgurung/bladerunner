@@ -1,0 +1,9 @@
+# Build outputs and generated artifacts: never commit these.
+/bladerunner
+/build/
+/dist/
+*.test
+*.out
+/internal/bpf/*.bpf.o
+__pycache__/
+/.vscode/

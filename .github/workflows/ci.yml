@@ -1,0 +1,96 @@
+# Continuous integration: build everything, then run all three test tiers.
+name: ci
+# Run on pushes to main and on every pull request. Plain `pull_request` (never
+# `pull_request_target`) so code from forks runs WITHOUT secrets or a write token.
+on:
+  push: {branches: [main]}
+  pull_request:
+# Least privilege: nothing here needs more than read access to the repository.
+permissions:
+  contents: read
+# A newer push to the same ref supersedes a running one.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  GOFLAGS: -mod=readonly   # never let CI rewrite go.mod or go.sum
+jobs:
+  test:
+    # GitHub-hosted Ubuntu runners support BPF with sudo, which the kernel tests and the loopback e2e need.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: {persist-credentials: false}   # do not leave the token in .git/config
+      # Go toolchain.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with: {go-version: '1.27'}
+      # clang compiles the BPF object; libbpf-dev provides bpf_helpers.h; linux-libc-dev provides the UAPI headers.
+      - name: toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang libbpf-dev linux-libc-dev
+      # Download exactly the versions pinned in go.mod/go.sum and verify their hashes.
+      - run: go mod download && go mod verify
+      # Static analysis (also proves the package compiles with the embedded object).
+      - run: make vet
+      # Build the BPF object and the binary.
+      - run: make build
+      # Tier 1: pure Go, no privileges.
+      - name: unit tests
+        run: make test-unit
+      # Tier 2: loads the program into the runner's kernel (runs the verifier) and exercises every verdict path with synthetic packets.
+      - name: kernel tests (verifier + BPF_PROG_TEST_RUN)
+        run: make test
+      # Tier 3: real XDP attach on lo in generic mode, with detection and mitigation closed loop.
+      - name: loopback e2e
+        run: make e2e
+
+  # Cross-architecture integration test. For each target CPU, boot a QEMU virtual
+  # machine, load the matching bladerunner binary onto the VM's test NIC and drive
+  # traffic at it from the runner (see scripts/vmtest.sh and docs/OPERATIONS.md).
+  # x86-64 uses KVM acceleration; aarch64 and riscv64 are fully emulated, so they
+  # are slow (several minutes to boot) but exercise the real binary and kernel.
+  vmtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64, riscv64]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: {persist-credentials: false}   # do not leave the token in .git/config
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with: {go-version: '1.27'}
+      - name: toolchain
+        run: |
+          sudo apt-get update
+          # clang/libbpf/libc headers build the BPF object. The qemu-* packages provide
+          # the three system emulators; qemu-efi-aarch64 and u-boot-qemu are the
+          # firmware the aarch64 and riscv64 cloud images boot from.
+          sudo apt-get install -y clang libbpf-dev linux-libc-dev \
+            qemu-system-x86 qemu-system-arm qemu-system-misc qemu-utils \
+            qemu-efi-aarch64 u-boot-qemu genisoimage
+      - name: enable KVM for the x86-64 guest
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+      # Cloud images are large; keep them between runs.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/bladerunner-vmtest
+          key: vmtest-images-${{ matrix.arch }}-${{ hashFiles('scripts/lib/vm.sh') }}
+          restore-keys: vmtest-images-${{ matrix.arch }}-
+      - run: make dist
+      - name: vm test (${{ matrix.arch }})
+        env:
+          VM_QUIET: '1'
+        run: ./scripts/vmtest.sh --keep --work "$RUNNER_TEMP/vmtest" ${{ matrix.arch }}
+      # Console logs only (never the throw-away SSH keys or disk images).
+      - name: collect VM console logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: vmtest-console-${{ matrix.arch }}
+          path: ${{ runner.temp }}/vmtest/*/console.log
+          retention-days: 1

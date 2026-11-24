@@ -1,0 +1,103 @@
+# bladerunner example configuration. Every key is optional; omitted keys use
+# the built-in defaults (see internal/config/config.go). Unknown keys are an
+# error, so a typo cannot silently disable a protection.
+
+# --- Where to attach --------------------------------------------------
+interface: eth0
+mode: native          # native = driver XDP; generic = slower, works on any NIC/veth
+dry_run: true         # classify and count, never drop. Flip with `bladerunner dryrun off`
+persist: false        # true: XDP stays attached if the daemon dies (fail-safe vs fail-open, see docs/OPERATIONS.md)
+pin_dir: /sys/fs/bpf/bladerunner
+metrics: 127.0.0.1:9100
+
+# Destinations to defend. Empty = filter everything arriving on the interface.
+# When set, traffic to any other destination is untouched.
+# --- Scope: what to defend and whom to trust ---------------------------
+protected:
+  - 203.0.113.0/24
+  - 2001:db8:100::/48
+
+# Sources that are never filtered (monitoring, upstream, your own ranges).
+# ALWAYS put your management and upstream addresses here before going live.
+allowlist:
+  - 192.0.2.10/32
+
+# Sources that are always dropped.
+blocklist: []
+
+# UDP reflection sources: source port -> minimum L3 length to drop (0 = any).
+# Remove port 53 if this host is a recursive resolver that needs replies,
+# and 123 if it is an NTP client.
+# --- Static hygiene filters -----------------------------------------
+amp_ports:
+  19: 0
+  123: 200
+  161: 200
+  389: 200
+  1900: 300
+  11211: 0
+  53: 512
+
+drop_fragments: true  # fragments rarely appear in legitimate traffic at the edge; disable if you carry tunnels
+sanity: true          # drop NULL / SYN+FIN / SYN+RST and port-0 TCP/UDP
+rate_limit: true
+sample_rate: 128      # 1-in-N packets are sent to userspace for analysis
+
+# Per-source-address token buckets (IPv6: per /64). pps 0 = unlimited.
+# Tune "normal" to ~10x your legitimate per-client peak.
+# --- Per-source rate limits -------------------------------------------
+limits:
+  normal:
+    syn:  {pps: 2000,  burst: 4000}
+    udp:  {pps: 20000, burst: 40000}
+    dns:  {pps: 2000,  burst: 4000}
+    icmp: {pps: 200,   burst: 400}
+  attack:               # applied automatically while an attack is detected
+    syn:  {pps: 200,   burst: 400}
+    udp:  {pps: 2000,  burst: 4000}
+    dns:  {pps: 200,   burst: 400}
+    icmp: {pps: 20,    burst: 40}
+
+# --- Adaptive behaviour: all of this runs in the daemon, not in the kernel ---
+detect:
+  interval: 1s
+  alpha: 0.05            # baseline EWMA weight
+  trigger_factor: 3      # attack when offered pps > baseline * 3 ...
+  min_pps: 100000        # ... and > this absolute floor. Set to ~2x your busiest normal second.
+  release_after: 30s     # must stay quiet this long to leave attack mode
+
+fingerprint:
+  enabled: true
+  min_tuple_pps: 20000   # a traffic signature must exceed this rate...
+  min_share: 0.10        # ...and this share of all traffic to become a rule
+  rate_factor: 2         # known signatures are limited to baseline * 2
+  min_rate_pps: 1000
+  baseline_alpha: 0.1
+  rule_ttl: 2m           # rules expire in-kernel even if the daemon dies
+
+heavy_hitter:
+  enabled: true
+  pps: 20000             # a single source above this for `windows` consecutive intervals...
+  windows: 3
+  block_ttl: 10m         # ...is blocked for this long
+  max_per_tick: 256
+
+# --- Optional: shared allow/block lists in Redis (off by default) -------------
+# One Redis key per CIDR range, named "<key_prefix>:<list>:<cidr>", where <list> is
+# "allow" or "block":   SET bladerunner:block:203.0.113.0/24 "port scanner" EX 3600
+# The key's Redis TTL becomes the in-kernel TTL (no TTL = permanent until deleted).
+# Redis is read-only here and never in the packet path. If it is down, the last
+# known lists stay in force (fail-open) and bladerunner_redis_up drops to 0.
+# Block ranges broader than /8 (IPv4) or /16 (IPv6) are refused as a safety net.
+redis:
+  enabled: false
+  addr: 127.0.0.1:6379
+  # username: bladerunner            # Redis 6+ ACL user (optional)
+  password_env: BLADERUNNER_REDIS_PASSWORD   # NAME of the env var holding the password
+  db: 0
+  tls: false
+  # ca_file: /etc/bladerunner/redis-ca.pem
+  key_prefix: bladerunner
+  poll_interval: 10s     # how often the lists are re-read
+  timeout: 2s            # per-operation network timeout
+  max_entries: 50000     # per list (allow is also capped at 1000 by the kernel map)

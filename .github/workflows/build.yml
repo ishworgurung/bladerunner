@@ -1,0 +1,106 @@
+# Multi-architecture build (produces binaries only; tests live in ci.yml): x86-64 (amd64), ARM 64-bit (arm64 / aarch64) and
+# RISC-V 64-bit (riscv64). On a version tag (v*) it also publishes a GitHub Release.
+name: build
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  GOFLAGS: -mod=readonly
+jobs:
+  # The eBPF object is compiled with `clang -target bpf`, which produces the same
+  # bytecode whatever machine builds it, so it is built ONCE here and embedded
+  # into all three Go binaries. The kernel's own JIT compiler turns that bytecode
+  # into native instructions for each CPU at load time.
+  bpf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: {persist-credentials: false}
+      - name: toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang libbpf-dev linux-libc-dev
+      - run: make bpf
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bpf-object
+          path: internal/bpf/bladerunner.bpf.o
+          if-no-files-found: error
+          retention-days: 1   # GitHub's minimum; cleanup.yml removes it after 2 hours
+
+  # Cross-compile one binary per architecture. cilium/ebpf is pure Go, so no C
+  # cross-compiler is needed: CGO is switched off and Go targets each CPU directly.
+  binaries:
+    needs: bpf
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {goarch: amd64,   label: x86_64}
+          - {goarch: arm64,   label: aarch64}
+          - {goarch: riscv64, label: riscv64}
+    env:
+      CGO_ENABLED: '0'
+      GOOS: linux
+      GOARCH: ${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: {fetch-depth: 0, persist-credentials: false}   # full history so `git describe` can stamp the version
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with: {go-version: '1.27'}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: bpf-object
+          path: internal/bpf
+      - name: build
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o bladerunner ./cmd/bladerunner
+      - name: package
+        run: |
+          NAME=bladerunner-${VERSION}-linux-${{ matrix.label }}
+          mkdir "$NAME"
+          cp bladerunner LICENSE THIRD_PARTY_NOTICES README.md "$NAME"/
+          cp configs/bladerunner.yaml "$NAME"/
+          tar czf "$NAME.tar.gz" "$NAME"
+          sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          file bladerunner
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bladerunner-linux-${{ matrix.label }}
+          retention-days: 1   # GitHub's minimum; cleanup.yml removes it after 2 hours
+          path: |
+            bladerunner-*.tar.gz
+            bladerunner-*.tar.gz.sha256
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # needed to create the release
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: bladerunner-linux-*
+          path: dist
+          merge-multiple: true
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Passed through the environment, never interpolated into the script,
+          # so a crafted tag name cannot inject shell commands.
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release create "$TAG" dist/* --repo "$REPO" --title "$TAG" --generate-notes
