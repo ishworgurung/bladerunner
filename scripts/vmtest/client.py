@@ -77,6 +77,52 @@ def drain(s):
         pass
 
 
+def wire_for(a, payload):
+    """Length-framed wire bytes and packets-per-block for one payload size or the IMIX."""
+    if payload == "imix":
+        parts = []
+        for size, n in ((18, 7), (548, 4), (1472, 1)):
+            a.size = size
+            f = build_frame(a)
+            parts += [struct.pack("!I", len(f)) + f] * n
+        return b"".join(parts), len(parts)
+    a.size = int(payload)
+    f = build_frame(a)
+    return struct.pack("!I", len(f)) + f, 1
+
+
+def serve(a):
+    """Hold one connection open and flood on command (see --serve)."""
+    s = connect(a.port)
+    threading.Thread(target=drain, args=(s,), daemon=True).start()
+    print("ready", flush=True)
+    for line in sys.stdin:
+        w = line.split()
+        if not w:
+            continue
+        if w[0] == "QUIT":
+            break
+        if w[0] != "FLOOD" or len(w) != 5:
+            print("error bad command", flush=True)
+            continue
+        rate, secs, payload, settle = float(w[1]), float(w[2]), w[3], float(w[4])
+        wire, per = wire_for(a, payload)
+        batch = max(1, int(rate // 100 // per))
+        sent, t0 = 0, time.time()
+        while time.time() < t0 + secs:
+            s.sendall(wire * batch)
+            sent += batch * per
+            ahead = sent / rate - (time.time() - t0)
+            if ahead > 0:
+                time.sleep(ahead)
+        time.sleep(settle)          # let the guest drain its backlog before the next step
+        print("sent", sent, flush=True)
+    s.shutdown(socket.SHUT_WR)
+    time.sleep(0.2)
+    s.close()
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--port", type=int, required=True, help="QEMU stream socket port")
@@ -87,41 +133,66 @@ def main():
     p.add_argument("--sport", type=int, default=40000)
     p.add_argument("--dport", type=int, default=19999)
     p.add_argument("--size", type=int, default=20, help="UDP payload bytes")
+    p.add_argument("--imix", action="store_true",
+                   help="send the standard Internet mix instead of --size: 7 parts 64-byte, 4 parts "
+                        "594-byte and 1 part 1518-byte Ethernet frames (UDP payloads of 18, 548 and 1472 bytes)")
     p.add_argument("--ttl", type=int, default=64)
     p.add_argument("--count", type=int, help="send exactly N packets")
     p.add_argument("--pace", type=float, default=0.0, help="seconds between packets (with --count)")
     p.add_argument("--duration", type=float, help="send for N seconds (needs --rate)")
     p.add_argument("--rate", type=float, help="packets per second (with --duration)")
+    p.add_argument("--serve", action="store_true",
+                   help="stay connected and run commands read from stdin, one per line: "
+                        "'FLOOD <pps> <seconds> <payload-bytes|imix> <settle-seconds>' prints the packet count "
+                        "when done; 'QUIT' disconnects. Used by scripts/vmbench.sh, which must never drop the "
+                        "connection mid-run (QEMU 11.x crashes when it flushes queued packets to a closed stream)")
+    p.add_argument("--linger", type=float, default=0.2,
+                   help="seconds to keep the connection open after the last packet, so the VM can drain "
+                        "its backlog before QEMU sees the disconnect (use a few seconds after heavy floods)")
     a = p.parse_args()
+    if a.serve:
+        return serve(a)
     if (a.count is None) == (a.duration is None):
         p.error("give exactly one of --count or --duration")
     if a.duration is not None and not a.rate:
         p.error("--duration needs --rate")
 
-    frame = build_frame(a)
-    wire = struct.pack("!I", len(frame)) + frame
+    if a.imix:
+        # One 12-packet block holds the mix; sending whole blocks keeps the ratio exact.
+        parts = []
+        for payload, n in ((18, 7), (548, 4), (1472, 1)):
+            a.size = payload
+            f = build_frame(a)
+            parts += [struct.pack("!I", len(f)) + f] * n
+        wire, per_wire = b"".join(parts), len(parts)
+    else:
+        frame = build_frame(a)
+        wire, per_wire = struct.pack("!I", len(frame)) + frame, 1
     s = connect(a.port)
     threading.Thread(target=drain, args=(s,), daemon=True).start()
 
     sent = 0
     if a.count is not None:
-        for _ in range(a.count):
+        for _ in range(-(-a.count // per_wire)):
             s.sendall(wire)
-            sent += 1
+            sent += per_wire
             if a.pace:
                 time.sleep(a.pace)
     else:
         # Send in small batches and sleep to hold the requested average rate.
         t0 = time.time()
         end = t0 + a.duration
-        batch = max(1, int(a.rate // 100))
+        batch = max(1, int(a.rate // 100 // per_wire))
         while time.time() < end:
             s.sendall(wire * batch)
-            sent += batch
+            sent += batch * per_wire
             ahead = sent / a.rate - (time.time() - t0)
             if ahead > 0:
                 time.sleep(ahead)
     # Let TCP flush, then close; QEMU keeps listening for the next client.
+    # Closing while QEMU still has a backlog queued for a slow guest has crashed
+    # QEMU 11.x (a NULL dereference in the stream netdev), so let it drain first.
+    time.sleep(a.linger)
     s.shutdown(socket.SHUT_WR)
     time.sleep(0.2)
     s.close()

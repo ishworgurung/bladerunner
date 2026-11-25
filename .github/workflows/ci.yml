@@ -56,6 +56,10 @@ jobs:
       fail-fast: false
       matrix:
         arch: [x86_64, aarch64, riscv64]
+        xdp_mode: [generic]
+        include:
+          # Native (driver-mode) XDP on virtio-net; x86-64 only because it needs KVM.
+          - {arch: x86_64, xdp_mode: native}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: {persist-credentials: false}   # do not leave the token in .git/config
@@ -82,15 +86,15 @@ jobs:
           key: vmtest-images-${{ matrix.arch }}-${{ hashFiles('scripts/lib/vm.sh') }}
           restore-keys: vmtest-images-${{ matrix.arch }}-
       - run: make dist
-      - name: vm test (${{ matrix.arch }})
+      - name: vm test (${{ matrix.arch }}, ${{ matrix.xdp_mode }})
         env:
           VM_QUIET: '1'
-        run: ./scripts/vmtest.sh --keep --work "$RUNNER_TEMP/vmtest" ${{ matrix.arch }}
+        run: ./scripts/vmtest.sh --keep --xdp-mode ${{ matrix.xdp_mode }} --work "$RUNNER_TEMP/vmtest" ${{ matrix.arch }}
       # Console logs only (never the throw-away SSH keys or disk images).
       - name: collect VM console logs on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: vmtest-console-${{ matrix.arch }}
+          name: vmtest-console-${{ matrix.arch }}-${{ matrix.xdp_mode }}
           path: ${{ runner.temp }}/vmtest/*/console.log
           retention-days: 1

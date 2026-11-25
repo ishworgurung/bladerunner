@@ -52,6 +52,7 @@ while [ $# -gt 0 ]; do
 done
 [ ${#ARCHES[@]} -gt 0 ] || ARCHES=(x86_64 aarch64 riscv64)
 case $XDP_MODE in generic|native) ;; *) die "--xdp-mode must be generic or native" ;; esac
+export VM_XDP_MODE=$XDP_MODE   # read by scripts/lib/vm.sh when it builds the test NIC
 need python3 curl ssh scp
 
 if [ -z "$WORK" ]; then WORK=$(mktemp -d "${TMPDIR:-/tmp}/bladerunner-vmtest.XXXXXX"); fi
@@ -169,6 +170,17 @@ run_arch() {
     ASSERT_FAILS=$((ASSERT_FAILS+1)); vm_stop; return 1
   fi
   _pass "$arch: daemon attached XDP ($XDP_MODE) to test0"
+  # Prove the attach mode, not just that the daemon says so: `ip -d link` puts an
+  # "xdp" flag on the interface line for a driver-mode program and "xdpgeneric"
+  # for a generic one (the "prog/xdp id N" line below it is the same for both).
+  local ipd; ipd=$(vm_ssh 'ip -d link show test0')
+  # shellcheck disable=SC2016  # the $(...) and quotes must expand on the guest
+  log "$arch: test0 driver: $(vm_ssh 'basename "$(readlink /sys/class/net/test0/device/driver)"'), queues: $(vm_ssh 'ls /sys/class/net/test0/queues | tr "\n" " "')"
+  if [ "$XDP_MODE" = native ]; then
+    assert_true "$arch: XDP is attached in driver (native) mode" grep -qE ' mtu [0-9]+ xdp ' <<<"$ipd"
+  else
+    assert_true "$arch: XDP is attached in generic mode" grep -qE ' mtu [0-9]+ xdpgeneric ' <<<"$ipd"
+  fi
   on_exit "vm_ssh 'sudo pkill -x bladerunner' >/dev/null 2>&1"
   sleep 1
   log "$arch: $(bladerunner status | sed -n 1,4p | tr '\n' ' ')"

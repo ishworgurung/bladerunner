@@ -16,7 +16,7 @@ BPF_SRC := bpf/bladerunner.bpf.c
 BPF_OBJ := internal/bpf/bladerunner.bpf.o
 
 # Targets that are commands, not files.
-.PHONY: all bpf build deps test test-unit e2e vet fmt clean install dist vmtest
+.PHONY: all bpf build deps test test-unit e2e vet fmt clean install dist vmtest vmtest-native vmbench
 
 # Default target.
 all: build
@@ -86,3 +86,13 @@ dist: bpf
 # test them from this host. No root needed. VMARCH="x86_64" limits it to one.
 vmtest: dist
 	./scripts/vmtest.sh $(VMARCH)
+
+# Same test with the program attached in native (driver) mode on a virtio-net
+# NIC. x86-64 only by default: it needs KVM to be quick.
+vmtest-native: dist
+	./scripts/vmtest.sh --xdp-mode native $(or $(VMARCH),x86_64)
+
+# Native versus generic XDP: guest CPU cost per dropped packet over several runs
+# in one KVM VM (see scripts/vmbench.sh). Pass BENCH="--runs 8 --rate 3000000".
+vmbench: dist
+	./scripts/vmbench.sh $(BENCH)

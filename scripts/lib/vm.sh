@@ -198,6 +198,16 @@ vm_start() {
   # The test NIC turns off guest offloads so that, if requested, native XDP can
   # attach to virtio-net (it refuses while LRO/checksum offload is negotiated).
   local testnic="virtio-net-pci,netdev=t0,mac=$VM_MAC_TEST,csum=off,guest_csum=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off"
+  # Native (driver-mode) XDP: also follow the NIC settings from
+  # https://gctl.io/blog/2020/xdp-ebpf-firewall-in-rust/ - every host-side
+  # offload off, no mergeable RX buffers, 256-entry queues. (That post also asks
+  # for 2N queues on N vCPUs; QEMU only offers multiple queues on tap/vhost
+  # backends, and this harness uses the rootless `stream` backend with a single
+  # queue pair. Kernels since 5.x then run XDP_TX in a locked single-queue mode,
+  # which is fine here because bladerunner only returns PASS or DROP.)
+  if [ "${VM_XDP_MODE:-generic}" = native ]; then
+    testnic+=",host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off,mrg_rxbuf=off,rx_queue_size=256,tx_queue_size=256"
+  fi
   log "$VM_ARCH: starting VM (ssh :$VM_SSH_PORT, test link :$VM_NET_PORT, slow=$VM_SLOW)"
   "$VM_QEMU" "${args[@]}" \
     -name "bladerunner-$VM_ARCH" -m "$VM_MEM" -smp "$VM_SMP" \
