@@ -93,7 +93,7 @@ internal/engine/   control loop
 internal/config/   YAML config
 internal/metrics/  Prometheus text exposition
 scripts/e2e_lo.sh  loopback end-to-end test
-docs/              ARCHITECTURE.md, OPERATIONS.md, STATUS.md (tested / TODO)
+docs/              ARCHITECTURE.md, DESIGN.md, OPERATIONS.md, BENCHMARKS.md (native vs generic), STATUS.md (tested / TODO)
 ```
 
 ## ✅ Status

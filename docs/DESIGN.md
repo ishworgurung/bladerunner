@@ -644,6 +644,14 @@ disable a protection.
 * **End-to-end** ([e2e_lo.sh](../scripts/e2e_lo.sh)) attaches to the loopback
   interface in generic mode for about thirty seconds, sends real traffic and
   checks that the daemon reacts.
+* **Cross-architecture VM tests** ([vmtest.sh](../scripts/vmtest.sh)) boot a
+  QEMU virtual machine for each of x86-64, aarch64 and riscv64, load the matching
+  binary, and send traffic at it from the host over a QEMU socket (no root
+  needed). They cover the filters, TTL blocks, dry-run, attack detection and the
+  optional Redis feed, including Redis going down.
+  `make vmtest-native` repeats this with XDP in native (driver) mode, and
+  `make vmbench` measures native against generic mode. Both are described in
+  [BENCHMARKS.md](BENCHMARKS.md).
 
 Recent history shows why these matter: one commit fixed a verifier-complexity
 failure and stopped tests from masking load failures by silently skipping.

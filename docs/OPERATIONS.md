@@ -119,6 +119,7 @@ make dist                       # cross-build dist/bladerunner-linux-{amd64,arm6
 make vmtest                     # all three architectures
 make vmtest VMARCH=x86_64      # one architecture
 scripts/vmtest.sh --boot-only riscv64   # just check that a VM boots
+make vmtest-native              # x86-64 with XDP in native (driver) mode
 ```
 
 **Requirements:** `qemu-system-{x86_64,aarch64,riscv64}`, `qemu-img`,
@@ -127,6 +128,11 @@ access to download the Ubuntu cloud images on first use (about 2 GB for all
 three, cached in `~/.cache/bladerunner-vmtest`; each is checked against Ubuntu's
 published SHA-256 sums). aarch64 needs UEFI firmware (`qemu-efi-aarch64`);
 riscv64 needs `u-boot-qemu` or the EDK2 RISC-V firmware.
+
+**Native (driver-mode) XDP.** `make vmtest-native` runs the same tests with the
+program attached in native mode, and `make vmbench` compares native and generic mode
+over several runs. Both are explained, with the NIC settings and the results, in
+[BENCHMARKS.md](BENCHMARKS.md).
 
 **How it works.** Each VM has two network cards:
 
