@@ -44,7 +44,11 @@ const usage = `bladerunner - XDP DDoS mitigation
 usage: bladerunner <command> [flags]
 
   run [-c file] [--iface IF] [--mode native|generic] [--dry-run=BOOL] [--persist]
+      [--last-good FILE] [--wait-iface DUR]
                      load, attach and manage the data plane (needs root)
+  systemd [--install] [--config FILE] [--bin PATH]
+                     print (or install) a systemd unit that starts the filter before
+                     the network comes up, with last-known-good config fallback
   status             attack state, flags and verdict counters
   stats              per-reason packet/byte counters
   block   PREFIX [--ttl DUR]     drop a source prefix (optionally temporary)
@@ -89,6 +93,8 @@ func main() {
 		err = cmdDryRun(args)
 	case "detach":
 		err = cmdDetach(args)
+	case "systemd":
+		err = cmdSystemd(args)
 	case "version", "--version", "-v":
 		fmt.Println("bladerunner", version)
 	case "help", "-h", "--help":
@@ -132,11 +138,18 @@ func cmdRun(args []string) error {
 	dry := fs.String("dry-run", "", "true|false (overrides config)")
 	// Command-line flags override the YAML file; the result is re-validated below.
 	persist := fs.Bool("persist", false, "keep XDP attached if the daemon exits")
+	lastGood := fs.String("last-good", "", "file holding the last known-good config: used if -c fails to load, and updated after a good start")
+	waitIface := fs.Duration("wait-iface", 0, "wait up to this long for the interface to appear (early boot)")
 	fs.Parse(args)
 
-	cfg, err := config.Load(*cfgPath)
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	cfg, usedLastGood, err := config.LoadWithFallback(*cfgPath, *lastGood)
 	if err != nil {
 		return err
+	}
+	if usedLastGood {
+		log.Error("config rejected: running with the LAST KNOWN-GOOD copy instead; fix the config file",
+			"config", *cfgPath, "last_good", *lastGood)
 	}
 	if *iface != "" {
 		cfg.Interface = *iface
@@ -163,7 +176,11 @@ func cmdRun(args []string) error {
 		return err
 	}
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	if *waitIface > 0 {
+		if err := waitForInterface(cfg.Interface, *waitIface); err != nil {
+			return err
+		}
+	}
 	// A leftover pin directory means another instance (or a --persist run) is active.
 	// Refusing is safer than silently replacing a live filter.
 	if _, err := os.Stat(cfg.PinDir); err == nil {
@@ -223,6 +240,17 @@ func cmdRun(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// The config has loaded, validated and attached: remember it as the last known-good
+	// copy (but never overwrite it with a fallback we are merely running from).
+	if *lastGood != "" && !usedLastGood {
+		if err := config.SaveLastGood(*cfgPath, *lastGood); err != nil {
+			log.Warn("could not save the last known-good config", "path", *lastGood, "err", err)
+		}
+	}
+	// Tell systemd (Type=notify) that the filter is now in place.
+	sdNotify("READY=1\nSTATUS=filtering on " + cfg.Interface)
+	defer sdNotify("STOPPING=1")
+
 	// Optional Redis feed of shared allow/block lists. The connection is lazy, so an
 	// unreachable Redis never stops the daemon from starting (fail-open).
 	var rfeed *feed.Feed
@@ -265,6 +293,9 @@ func cmdRun(args []string) error {
 			if err := eng.Reload(nc); err != nil {
 				log.Error("reload failed", "err", err)
 				continue
+			}
+			if err := config.SaveLastGood(*cfgPath, *lastGood); err != nil {
+				log.Warn("could not save the last known-good config", "path", *lastGood, "err", err)
 			}
 			log.Info("config reloaded (prefixes are added, never removed; use `bladerunner unblock`)")
 		}

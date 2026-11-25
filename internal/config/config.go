@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -317,4 +318,57 @@ func (c *Config) BPF(prev bpf.Config) bpf.Config {
 	out.Lim[0] = c.Limits.Normal.arr()
 	out.Lim[1] = c.Limits.Attack.arr()
 	return out
+}
+
+// LoadWithFallback loads path; if that fails (missing file, YAML error, failed
+// validation) and lastGood names a saved copy, it loads that instead and reports
+// used=true. This is the boot-time safety net: a typo in the config must not leave
+// a host with no filter at all. If neither works, the error from path is returned.
+func LoadWithFallback(path, lastGood string) (c *Config, used bool, err error) {
+	c, err = Load(path)
+	if err == nil || lastGood == "" {
+		return c, false, err
+	}
+	if _, serr := os.Stat(lastGood); serr != nil {
+		return nil, false, err
+	}
+	fc, ferr := Load(lastGood)
+	if ferr != nil {
+		return nil, false, fmt.Errorf("%w (and the last known-good copy %s is unusable too: %v)", err, lastGood, ferr)
+	}
+	return fc, true, nil
+}
+
+// SaveLastGood records the config file at src as the last known-good copy. It
+// writes a temporary file in the same directory and renames it, so a crash or a
+// full disk can never leave a half-written copy. Call it only for a config that
+// has loaded, validated and been applied.
+func SaveLastGood(src, lastGood string) error {
+	if src == "" || lastGood == "" {
+		return nil
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(lastGood), 0o750); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(lastGood), ".last-good-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o640); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), lastGood)
 }

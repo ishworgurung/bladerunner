@@ -35,6 +35,60 @@ prefixes apply; **prefixes removed from the file are not removed** from the
 maps (use `bladerunner unblock` / `bladerunner unallow`). Interface, mode and pin dir need a
 restart.
 
+## 🚀 Running as a service (systemd)
+
+`bladerunner systemd` writes a systemd unit for this machine, so an administrator
+does not have to hand-write one:
+
+```sh
+sudo install -m 0755 bladerunner /usr/local/bin/bladerunner
+sudo install -D -m 0640 my.yaml /etc/bladerunner/bladerunner.yaml   # the unit does nothing without this
+bladerunner systemd                       # just print the unit and read it first
+sudo bladerunner systemd --install        # write /etc/systemd/system/bladerunner.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now bladerunner
+```
+
+Options: `--config` (default `/etc/bladerunner/bladerunner.yaml`), `--bin` (default
+`/usr/local/bin/bladerunner`), `--pin` (must equal `pin_dir` in the config; default
+`/sys/fs/bpf/bladerunner`), `--wait-iface` (how long to wait for the NIC at boot, default
+30s), `--unit-dir`, and `--force` to overwrite an existing unit. Paths must be absolute
+and free of spaces and special characters, because they go straight into the unit.
+
+**What the unit does**
+
+* **Starts before the network.** `DefaultDependencies=no`, `Wants=` and `Before=network-pre.target`
+  put the filter ahead of network configuration, which is the point of a boot-time unit: no
+  window with the host exposed and no filter.
+* **Ready means attached.** The unit is `Type=notify`. bladerunner tells systemd it is ready only
+  after XDP is attached (`sd_notify`), so units ordered after it can rely on the filter being up.
+* **Waits for the interface.** At early boot the NIC may not exist yet; `run --wait-iface 30s`
+  waits for it. If the device appears later than that, or after the network is up (hotplug), a
+  window remains.
+* **Last known-good config.** `run --last-good FILE` saves a copy of the config after it has
+  loaded, validated and attached, and again after every successful SIGHUP reload. If the file
+  later fails to load (a typo, a bad edit), the service starts from that copy instead and logs
+  `config rejected: running with the LAST KNOWN-GOOD copy` as an error. It never overwrites the
+  saved copy with a config it is only falling back to. If there is no usable copy, it refuses to
+  start, as before. The copy lives in `/var/lib/bladerunner/last-good.yaml` (mode 0640).
+* **Recovers from a crash.** `Restart=on-failure` restarts it after 2s. A crash leaves pin files
+  behind that would make the next start refuse ("another instance is active"), so
+  `ExecStartPre` runs `bladerunner detach` first (its failure is ignored).
+* **Reload and stop.** `systemctl reload bladerunner` sends SIGHUP. Stopping the service
+  detaches XDP, so the host runs unfiltered; this is the fail-open default (see "Persist vs.
+  fail-open"). The unit does not use `--persist`, because a persisted filter would block the
+  restart that `Restart=` performs.
+* **Hardening** that leaves what XDP needs: `NoNewPrivileges`, `PrivateTmp`, `ProtectHome`,
+  `ProtectSystem=strict` (with `/sys/fs/bpf` writable), `ProtectKernelModules`,
+  `ProtectControlGroups`, `RestrictRealtime`, `LockPersonality`. It still runs as root; a
+  least-privilege run mode is on the TODO list in [STATUS.md](STATUS.md).
+
+**Tested** in the VM test (`make vmtest`, phase 6): `systemd-analyze verify`, the ordering
+property, start with notify, XDP attached by the service, the last-good copy being saved,
+filtering, restart with a deliberately broken config, recovery after `kill -9`, and stop
+detaching XDP. A reboot with the unit enabled, to see it attach ahead of a real network
+target, is not tested yet.
+
 ## 🖧 NIC notes
 
 * Native XDP needs driver support (`ethtool -i`). Mellanox mlx5, Intel

@@ -118,6 +118,8 @@ set_scale() {
 
 # write_config PATH: the daemon config pushed to the guest. Rate-limit classes
 # are unlimited so only the filters under test act (as in scripts/e2e_lo.sh).
+PIN_DIR=/sys/fs/bpf/bladerunner-vmtest
+
 write_config() {
   cat > "$1" <<YAML
 interface: test0
@@ -130,11 +132,15 @@ sample_rate: 8
 detect: {interval: 500ms, min_pps: $MIN_PPS, trigger_factor: 3, release_after: 3s, alpha: 0.2}
 fingerprint: {min_tuple_pps: $TUPLE_PPS, min_share: 0.2, rule_ttl: 20s, baseline_alpha: 0.5}
 heavy_hitter: {pps: $HH_PPS, windows: 2, block_ttl: 60s}
-${REDIS_PORT:+redis: {enabled: true, addr: "10.0.2.2:$REDIS_PORT", key_prefix: vmtest-$VM_ARCH, poll_interval: 1s, timeout: 500ms}}
 limits:
   normal: {udp: {pps: 0, burst: 0}, syn: {pps: 0, burst: 0}, dns: {pps: 0, burst: 0}, icmp: {pps: 0, burst: 0}}
   attack: {udp: {pps: 0, burst: 0}, syn: {pps: 0, burst: 0}, dns: {pps: 0, burst: 0}, icmp: {pps: 0, burst: 0}}
 YAML
+  # Only when a host Redis is running. (A ${VAR:+...} expansion cannot hold the braces of a YAML map.)
+  if [ -n "$REDIS_PORT" ]; then
+    printf 'redis: {enabled: true, addr: "10.0.2.2:%s", key_prefix: vmtest-%s, poll_interval: 1s, timeout: 500ms}\n' \
+      "$REDIS_PORT" "$VM_ARCH" >> "$1"
+  fi
 }
 
 run_arch() {
@@ -273,6 +279,47 @@ run_arch() {
     assert_ge "$arch: source delivered after Redis withdrew the block" "$(rx_get "$VM_SUBNET".106 40011 19999)" 9
     bladerunner list block 2>&1 | sed 's/^/    /' >&2 || true
   fi
+
+  # --- Phase 6: the systemd unit (boot-time start, last known-good, crash recovery) -------
+  log "$arch: phase 6: systemd unit"
+  vm_ssh 'sudo pkill -x bladerunner' >/dev/null 2>&1 || true
+  retry 30 1 vm_ssh "! test -e $PIN_DIR" || warn "$arch: manual daemon left $PIN_DIR behind"
+  local BIN=/usr/local/bin/bladerunner CFG=/etc/bladerunner/bladerunner.yaml UNIT=/etc/systemd/system/bladerunner.service
+  vm_ssh "sudo install -m 0755 ~/bladerunner $BIN && sudo install -D -m 0640 ~/bladerunner.yaml $CFG"
+  # The unit comes from the CLI itself, exactly as an administrator would make it.
+  vm_ssh "sudo $BIN systemd --pin $PIN_DIR --install && sudo systemctl daemon-reload"
+  assert_true "$arch: systemd-analyze accepts the generated unit" vm_ssh "systemd-analyze verify $UNIT"
+  assert_true "$arch: unit is ordered before network-pre.target" \
+    vm_ssh "systemctl show bladerunner -p Before --value | grep -qw network-pre.target"
+  # Type=notify: start returns only once the filter is attached.
+  assert_true "$arch: systemctl start succeeds (READY after XDP attach)" vm_ssh 'sudo systemctl start bladerunner'
+  assert_eq "$arch: service is active" "$(vm_ssh 'systemctl is-active bladerunner')" active
+  assert_true "$arch: XDP is attached to test0 by the service" vm_ssh "ip -d link show test0 | grep -q ' xdp'"
+  assert_true "$arch: last known-good config was saved" vm_ssh 'sudo test -s /var/lib/bladerunner/last-good.yaml'
+  send --src-ip "$VM_SUBNET".101 --sport 40020 --count 20 --pace "$PACE"
+  send --src-ip "$VM_SUBNET".100 --sport 40021 --count 20 --pace "$PACE"
+  sleep "$SETTLE"
+  assert_eq "$arch: service filters (blocklisted source dropped)" "$(rx_get "$VM_SUBNET".101 40020 19999)" 0
+  assert_ge "$arch: service passes clean traffic" "$(rx_get "$VM_SUBNET".100 40021 19999)" 18
+
+  # A broken config must not leave the host unfiltered: the service starts from the last good copy.
+  vm_ssh "printf 'interface: test0\nbogus_key: 1\n' | sudo tee $CFG >/dev/null"
+  assert_true "$arch: restart with a broken config still succeeds" vm_ssh 'sudo systemctl restart bladerunner'
+  assert_true "$arch: log says it fell back to the last known-good config" \
+    vm_ssh "sudo journalctl -u bladerunner --no-pager -n 60 | grep -q 'LAST KNOWN-GOOD'"
+  send --src-ip "$VM_SUBNET".101 --sport 40022 --count 20 --pace "$PACE"
+  sleep "$SETTLE"
+  assert_eq "$arch: fallback config still blocks the blocklisted source" "$(rx_get "$VM_SUBNET".101 40022 19999)" 0
+
+  # A crash (kill -9) is recovered by systemd, including the stale pins the crash leaves behind.
+  local pid0; pid0=$(vm_ssh 'systemctl show bladerunner -p MainPID --value')
+  vm_ssh 'sudo pkill -9 -x bladerunner' >/dev/null 2>&1 || true
+  assert_true "$arch: service restarts by itself after kill -9" \
+    retry 40 1 vm_ssh "test \"\$(systemctl is-active bladerunner)\" = active && test \"\$(systemctl show bladerunner -p MainPID --value)\" != $pid0 && ip -d link show test0 | grep -q ' xdp'"
+
+  # Stopping the service removes the filter (the default is fail-open, not persist).
+  vm_ssh 'sudo systemctl stop bladerunner'
+  assert_true "$arch: stopping the service detaches XDP" vm_ssh "! ip -d link show test0 | grep -q ' xdp'"
 
   if [ "$ASSERT_FAILS" -gt "$fails0" ]; then
     warn "$arch: failures: dumping daemon log"; vm_ssh 'tail -n 40 /tmp/bladerunner.log' >&2 || true
