@@ -753,7 +753,7 @@ autonomous. An optional **approval mode** would turn each candidate rule into a
 pending proposal that an operator confirms with a command such as
 `bladerunner rules approve <id>`, with auto-approve left as the default so unattended
 operation does not change. This also gives a natural place to attach imported
-rules (for example the Snort-rule import in [STATUS.md](STATUS.md)).
+rules from outside sources (for example a possible future import of DDoS-specific rulesets, noted as low priority in [STATUS.md](STATUS.md)).
 
 ### 12.3 Measure the effect, keep what works
 

@@ -31,7 +31,7 @@ source blocks into BPF maps at runtime. The CLI is `bladerunner`.
 | Heavy hitters | A source above a rate for N windows gets a TTL block |
 | Safety | Dry-run (default), allowlist first, ND/ARP/non-IP untouched, fail-open, rules expire without the daemon |
 | Shared lists | Optional: allow and block CIDR ranges from Redis, mirrored into the kernel maps; Redis down means last known lists stay (fail-open) |
-| Ops | `bladerunner` CLI over pinned maps, Prometheus `/metrics`, SIGHUP reload |
+| Ops | `bladerunner` CLI over pinned maps, Prometheus `/metrics`, SIGHUP reload, a generated systemd unit that starts before the network with last-known-good config fallback (`bladerunner systemd`) |
 
 ## 🚀 Quick start
 
