@@ -16,7 +16,7 @@ BPF_SRC := bpf/bladerunner.bpf.c
 BPF_OBJ := internal/bpf/bladerunner.bpf.o
 
 # Targets that are commands, not files.
-.PHONY: all bpf build deps test test-unit e2e vet fmt clean install dist vmtest vmtest-native vmbench
+.PHONY: all bpf build deps test test-unit e2e vet fmt clean install dist vmtest vmtest-native vmbench lint
 
 # Default target.
 all: build
@@ -58,6 +58,24 @@ e2e: build
 # go vet needs the embedded object to exist, hence the dependency on bpf.
 vet: bpf
 	$(GO) vet ./...
+
+# staticcheck is built from source by `go run`, with the same Go as the rest of the
+# build. An installed staticcheck binary is not used: one built with an older Go cannot
+# read Go 1.27 packages and fails with "export data version ... is greater than maximum".
+# The first run needs network access to fetch it; later runs use the module cache.
+STATICCHECK ?= $(GO) run honnef.co/go/tools/cmd/staticcheck@2026.2.2
+
+# Every linter we use. gofmt, go vet, shellcheck and staticcheck are required; the rest
+# run when installed (CI installs them) and are reported as skipped otherwise.
+lint: bpf
+	@test -z "$$(gofmt -l cmd internal)" || { echo "gofmt needs to be run on:"; gofmt -l cmd internal; exit 1; }
+	$(GO) vet ./...
+	shellcheck -x -P scripts scripts/*.sh scripts/lib/*.sh
+	python3 -m py_compile scripts/vmtest/*.py
+	$(STATICCHECK) ./...
+	@if command -v actionlint >/dev/null; then actionlint; else echo "skipped: actionlint (not installed)"; fi
+	@if command -v ruff >/dev/null; then ruff check scripts && ruff format --check scripts; else echo "skipped: ruff (not installed)"; fi
+	@if command -v yamllint >/dev/null; then yamllint .; else echo "skipped: yamllint (not installed)"; fi
 
 # Format all Go sources.
 fmt:

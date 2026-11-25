@@ -1,0 +1,12 @@
+# YAML lint settings. Column alignment in flow mappings (e.g. `{pps: 2000,  burst: 4000}`)
+# is deliberate, so spacing after colons and commas is not checked.
+extends: default
+rules:
+  line-length: disable
+  document-start: disable
+  truthy: {check-keys: false}
+  colons: disable
+  commas: disable
+  braces: disable
+  comments: {min-spaces-from-content: 2}
+  comments-indentation: disable

@@ -8,6 +8,7 @@ times a second so the host can read them over SSH at any moment.
 
   rx.py OUTFILE PORT [PORT...]
 """
+
 import json
 import os
 import selectors
@@ -34,7 +35,7 @@ while True:
                 _, (ip, sport) = key.fileobj.recvfrom(65535)
             except BlockingIOError:
                 break
-            k = "%s:%d:%d" % (ip, sport, key.data)
+            k = f"{ip}:{sport}:{key.data}"
             counts[k] = counts.get(k, 0) + 1
     now = time.time()
     if now - last >= 0.25:
