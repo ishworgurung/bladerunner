@@ -112,6 +112,8 @@ to fit. Rates that become identical run only once.
 | `--duration S` | 10 | Seconds in each measured window |
 | `--cpus N` | 4 | Virtual CPUs in the VM |
 | `--max-gbps G` | 10 | Cap on offered frame data, in Gbit/s |
+| `--http` | off | While the flood runs, fetch a 512 KiB page from a web server in the VM through the same virtual NIC (see "Genuine web requests during the flood") |
+| `--http-rate N` | 50 | Web requests per second for `--http` |
 | `--gbps LIST` | none | Offered loads in Gbit/s of frame data, instead of `--rates`; converted to packets per second for each size, and `--max-gbps` does not apply |
 | `--json FILE` | none | Also write the results as JSON |
 | `--keep`, `--work DIR` | off | Keep the working directory |
@@ -219,6 +221,94 @@ virtual-machine effects may be hiding some of it. The savings of 83 to 95% in th
 table are probably too high. The conclusion that holds up is the throughput one:
 generic stops at about 3.2 M pps and native does not.
 
+### Genuine web requests during the flood
+
+Packet counters say how the filter copes. They do not say what a real user sees. So
+`--http` also makes genuine web requests **while the flood is running**, through the
+same virtual NIC and the same XDP hook, and measures them.
+
+**How.** A small web server in the VM (`scripts/vmtest/httpd.py`) returns a 512 KiB body
+for every request. The host has no network stack on the test link, so the sender
+(`scripts/vmtest/httpload.py`) carries a minimal ARP, TCP and HTTP client of its own: it
+opens a connection, sends one `GET`, acknowledges the reply, retransmits its own lost
+packets, and records the **connect time**, the **time to first byte (TTFB)** and the
+**total time**. TTFB is counted from the start of the connection, as `curl` does. Requests
+start at a **fixed rate** (50 per second, one every 20 ms) whether or not earlier ones
+finished, so a slow server cannot hide its latency by receiving fewer requests. The
+requests use their own source address, which is not on the blocklist, so the filter passes
+them. They start two seconds into each measured window and run for the whole window, with
+the flood at full strength. The same requests also run in the same VM and mode with **no
+flood**, as the baseline. Results are pooled over the 3 runs (1500 requests per row).
+
+**Results** (x86-64 KVM, 4 vCPUs, 3 runs per mode, 1500 requests per cell; times in
+milliseconds; "failed" counts requests that were reset, timed out after 8 s or came back
+incomplete). With no flood, every row had TTFB p50 0.5 ms and p99 about 0.9 ms, so that is
+the baseline. Raw numbers: [benchmarks/http-under-flood-2026-11-25.json](benchmarks/http-under-flood-2026-11-25.json).
+
+| Payload | Offered | Generic: failed | TTFB p50 | TTFB p99 | total p99 | Native: failed | TTFB p50 | TTFB p99 | total p99 |
+|---|---|---|---|---|---|---|---|---|---|
+| 512 B | 10 Gbit/s | 0 | 0.7 | 1.1 | 6.6 | 0 | 0.5 | 3.1 | 11.4 |
+| 512 B | 15 Gbit/s | 2 | **224** | **572** | **3,020** | 0 | 0.7 | 15.6 | 35.2 |
+| 512 B | 20 Gbit/s | **55** | **1,174** | **2,595** | **7,905** | 0 | 36.1 | 39.3 | 133.8 |
+| 512 B | 25 Gbit/s | 4 | **1,136** | **1,921** | **6,575** | 0 | 36.1 | 49.2 | 202.5 |
+| 1472 B | 10 Gbit/s | 0 | 0.5 | 1.0 | 4.2 | 0 | 0.6 | 1.1 | 4.6 |
+| 1472 B | 15 Gbit/s | 0 | 0.5 | 1.2 | 5.3 | 0 | 0.6 | 1.1 | 5.5 |
+| 1472 B | 20 Gbit/s | 0 | 0.6 | 4.1 | 10.3 | 0 | 0.6 | 6.5 | 13.8 |
+| 1472 B | 25 Gbit/s | 0 | 0.6 | 7.7 | 21.3 | 0 | 0.5 | 8.1 | 19.7 |
+| IMIX | 10 Gbit/s | **540 (36%)** | **2,163** | **3,018** | **7,974** | 0 | 0.6 | 8.6 | 21.9 |
+| IMIX | 15 Gbit/s | **1500 (100%)** | n/a | n/a | n/a | 0 | 44.4 | 54.3 | 172.4 |
+| IMIX | 20 Gbit/s | **1500 (100%)** | n/a | n/a | n/a | 0 | 44.7 | 486.3 | 609.0 |
+| IMIX | 25 Gbit/s | **1500 (100%)** | n/a | n/a | n/a | 0 | 44.8 | 53.5 | 176.0 |
+
+("Offered" is the target. The host could not send more than about 4 to 5 million packets
+per second, so above that the delivered load was lower: at most about 17.9 Gbit/s of 512 B
+and 13.8 Gbit/s of IMIX. Generic handled about 3.1 million packets per second at most.)
+
+**What it shows.**
+
+1. **Generic mode takes the service down once the flood passes its ceiling.** Past about
+   3.1 million packets per second, real requests wait seconds for the first byte, 55 of 1500
+   fail at 512 B and 540 of 1500 (36%) at IMIX 10 Gbit/s, and in the heavier IMIX stages
+   every single request fails. The filter
+   is dropping the attack, but the guest has no CPU left to receive the legitimate packets
+   before the filter ever runs, so they are lost with the flood.
+2. **Native mode kept the service up in every stage.** Not one request failed in 18,000
+   (12 rows by 1500). Tail latency still rose, to tens of milliseconds, but the page
+   always loaded.
+3. **Below the generic ceiling the two modes are the same.** With full-size packets the
+   flood is only about 1 to 2 million packets per second, which generic handles, so both
+   modes showed a few milliseconds of extra tail latency at 20 and 25 Gbit/s and nothing
+   else. A volumetric flood of big packets is not what separates them; a flood of many
+   packets is.
+4. **For an operator:** with generic mode, the attack succeeds as a denial of service on
+   everything else on that interface, even though the filter is "working". Native mode is
+   what lets the filter protect a service.
+
+**Read the absolute numbers with care.**
+
+* **The 36 to 45 ms in native's TTFB at the heaviest stages is mostly the harness.** The
+  sender and QEMU's network backend saturate at about 4 to 5 million packets per second, so
+  the request packets queue behind the flood in the test link. The value is nearly constant
+  (36 ms, then 44 ms) across offered loads above that point, which fits a full queue of
+  fixed size rather than a guest that is overloaded. Queueing behind an attack in one shared
+  queue is realistic; the size of that queue is not. Treat these figures as "tens of
+  milliseconds, not seconds".
+* **Some baseline rows are contaminated.** The no-flood baseline for generic at IMIX 20 and
+  25 Gbit/s shows a p99 of 450 to 1,040 ms. It runs right after a stage whose flood left a
+  backlog in the test link, which had not finished draining. Every other baseline is about
+  1 ms.
+* **Occasional spikes.** One native cell (IMIX at 20 Gbit/s) has a p99 of 486 ms against
+  about 54 ms in its neighbours; with 1500 requests, a few slow ones decide the p99.
+* **The client shares a Python process with the flood sender**, so it adds a small floor
+  (about 0.5 ms of TTFB in the baseline) and some jitter. That is why the comparison is with
+  the baseline, not with zero.
+* **The CPU-per-packet figures in this run are not comparable to the earlier run.** The
+  web server's own CPU is included, and the flood is sent in small pieces (so the requests
+  interleave with it) instead of 10 ms bursts. Use the earlier no-HTTP sweep for CPU cost.
+* **One request pattern and one page size** (50 requests per second, 512 KiB). A busier
+  site, bigger pages, TLS or several virtual hosts would change the numbers. The qualitative
+  result (a saturated generic receive path starves legitimate traffic) should not.
+
 ### Limits: how far to trust it
 
 * **It is a relative figure, not an absolute one.** virtio-net is a software driver, so
@@ -270,5 +360,7 @@ backend, which needs root.
 | `scripts/vmtest.sh` | The functional test; `--xdp-mode native` selects driver mode |
 | `scripts/vmbench.sh` | The native-versus-generic benchmark |
 | `scripts/lib/vm.sh` | Builds the VM and its NICs, including the native-mode settings |
-| `scripts/vmtest/client.py` | Host-side packet sender used by both scripts; `--serve` keeps one connection open for the benchmark |
+| `scripts/vmtest/client.py` | Host-side packet sender used by both scripts; `--serve` keeps one connection open for the benchmark and runs flood and web-request commands at the same time |
+| `scripts/vmtest/httpload.py` | The small ARP, TCP and HTTP client that fetches pages through the test NIC during the flood |
+| `scripts/vmtest/httpd.py` | The web server in the VM that returns a 512 KiB body |
 | `docs/benchmarks/` | Raw JSON results of the published runs |

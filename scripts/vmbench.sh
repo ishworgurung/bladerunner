@@ -24,7 +24,7 @@ source "$HERE/lib/common.sh"
 # shellcheck source=lib/vm.sh
 source "$HERE/lib/vm.sh"
 
-RUNS=3; RATES=1500000,3000000,4000000,5000000,6000000; CPUS=4; DURATION=10; SIZES=60,512,1472,imix; MAX_GBPS=10; GBPS=; WORK=; KEEP=0; BR_DIR=$ROOT/dist; OUT=
+RUNS=3; RATES=1500000,3000000,4000000,5000000,6000000; CPUS=4; DURATION=10; SIZES=60,512,1472,imix; MAX_GBPS=10; GBPS=; HTTP=0; HTTP_RATE=50; WORK=; KEEP=0; BR_DIR=$ROOT/dist; OUT=
 usage() {
   cat <<EOF
 usage: $0 [options]
@@ -32,6 +32,11 @@ usage: $0 [options]
   --rates LIST    comma-separated offered loads in packets per second, run in this
                   order (default 1500000,3000000,4000000,5000000,6000000)
   --rate PPS      shorthand for a single rate
+  --http          while the flood runs, fetch a 512 KiB page from a web server in the VM
+                  through the SAME virtual NIC, and report time to first byte and total
+                  time (p50/p90/p99/max), with and without the flood
+  --http-rate N   requests per second for --http (default 50; a new request starts every
+                  1/N s whether or not earlier ones finished)
   --gbps LIST     comma-separated offered loads in Gbit/s of frame data instead of
                   --rates: each is converted to packets per second for every size, and
                   --max-gbps does not apply (use it to push past 10 Gbit/s)
@@ -57,6 +62,8 @@ while [ $# -gt 0 ]; do
     --rates) RATES=$2; shift 2 ;;
     --rate) RATES=$2; shift 2 ;;
     --gbps) GBPS=$2; shift 2 ;;
+    --http) HTTP=1; shift ;;
+    --http-rate) HTTP_RATE=$2; shift 2 ;;
     --cpus) CPUS=$2; shift 2 ;;
     --duration) DURATION=$2; shift 2 ;;
     --sizes) SIZES=$2; shift 2 ;;
@@ -87,6 +94,8 @@ vm_wait_ready
 
 PIN=/sys/fs/bpf/bladerunner-vmtest
 SRC=$VM_SUBNET.50
+HTTP_IP=$VM_SUBNET.60     # the web client's address: not on the blocklist
+HTTP_BODY=524288          # 512 KiB per response
 
 write_config() { # MODE
   cat > "$VM_DIR/bladerunner.yaml" <<YAML
@@ -138,13 +147,27 @@ echo "$a|$b|$p0|$p1"'
 # measure yes|no RATE SIZE: sets MEASURE_OUT to "busy_jiffies total_jiffies packets sent", or FAIL if
 # the guest could not be sampled (it was saturated and stopped answering SSH).
 measure() {
-  local traffic=$1 rate=$2 size=$3 count=0
+  local traffic=$1 rate=$2 size=$3 count=0 expect=0 word val phase=idle tag
+  [ "$traffic" = yes ] && phase=load
+  tag="${HTTP_TAG:-x}_$phase"
   if [ "$traffic" = yes ]; then
-    # Ask the long-lived sender to flood; it replies "sent N" when finished and settled.
-    printf 'FLOOD %s %s %s 4\n' "$rate" "$((DURATION + 4))" "$size" >&"${SENDER[1]}"
+    # The flood runs for the whole window plus a lead-in and a settle time. A chunk size
+    # keeps the web requests interleaved with it on the NIC instead of queueing behind bursts.
+    printf 'FLOOD %s %s %s 4 %s\n' "$rate" "$((DURATION + 4))" "$size" "$([ "$HTTP" = 1 ] && echo 128 || echo 0)" >&"${SENDER[1]}"
+    expect=$((expect + 1))
+  fi
+  if [ "$HTTP" = 1 ]; then
+    # Starts 2 s in (the sampler's lead-in) and lasts the sampled window: the web requests
+    # run WHILE the flood is at full strength.
+    printf 'HTTP %s %s 2 %s\n' "$HTTP_RATE" "$DURATION" "$WORK/http/$tag.json" >&"${SENDER[1]}"
+    expect=$((expect + 1))
   fi
   local out; out=$(vm_ssh "$SAMPLER" 2>/dev/null) || out=
-  if [ "$traffic" = yes ]; then read -r _ count <&"${SENDER[0]}" || count=0; fi
+  while [ "$expect" -gt 0 ]; do
+    read -r word val <&"${SENDER[0]}" || break
+    case $word in sent) count=$val ;; esac
+    expect=$((expect - 1))
+  done
   if [ -z "$out" ]; then MEASURE_OUT=FAIL; return 0; fi
   MEASURE_OUT=$(python3 - "$out" "$count" <<'PY'
 import sys
@@ -163,7 +186,7 @@ PY
 # One sender process keeps a single connection to the VM's NIC for the whole run.
 # Reconnecting per run crashed QEMU 11.x under heavy load (see client.py --serve).
 coproc SENDER { python3 "$HERE/vmtest/client.py" --serve --port "$VM_NET_PORT" --dst-mac "$VM_MAC_TEST" \
-  --dst-ip "$VM_TEST_IP" --src-ip "$SRC"; }
+  --dst-ip "$VM_TEST_IP" --src-ip "$SRC" --http-ip "$HTTP_IP"; }
 read -r -u "${SENDER[0]}" ready_line; [ "$ready_line" = ready ] || die "sender did not start"
 on_exit "printf 'QUIT\\n' >&${SENDER[1]} 2>/dev/null || true"
 
@@ -171,6 +194,12 @@ log "VM up ($VM_SMP vCPUs). Copying the binary."
 vm_scp "$BR_DIR/bladerunner-linux-amd64" "/home/$VM_USER/"
 vm_ssh "mv ~/bladerunner-linux-amd64 ~/bladerunner && chmod +x ~/bladerunner"
 retry 30 1 vm_ssh 'true'
+if [ "$HTTP" = 1 ]; then
+  vm_scp "$HERE/vmtest/httpd.py" "/home/$VM_USER/"
+  vm_ssh "nohup python3 ~/httpd.py 8080 $HTTP_BODY >/tmp/httpd.log 2>&1 &"
+  retry 30 1 vm_ssh "ss -ltn | grep -q ':8080 '" || die "the web server in the VM did not start"
+  mkdir -p "$WORK/http"
+fi
 
 RES="$WORK/results.tsv"; : > "$RES"
 IFS=, read -ra RATE_LIST <<<"$RATES"
@@ -201,6 +230,7 @@ for size in "${SIZE_LIST[@]}"; do
       if (( i % 2 )); then order="generic native"; else order="native generic"; fi
       for mode in $order; do
         start_daemon "$mode"
+        HTTP_TAG="${size}_${rate}_${i}_${mode}"
         measure no 0 "$size"; idle=$MEASURE_OUT     # same window with no traffic: the noise floor
         measure yes "$rate" "$size"; load=$MEASURE_OUT
         stop_daemon
@@ -215,9 +245,10 @@ for size in "${SIZE_LIST[@]}"; do
   done
 done
 
-python3 - "$RES" "$DURATION" "${OUT:-}" "$RUNS" "$VM_SMP" <<'PY'
+python3 - "$RES" "$DURATION" "${OUT:-}" "$RUNS" "$VM_SMP" "$([ "$HTTP" = 1 ] && echo "$WORK/http")" "$HTTP_RATE" <<'PY'
 import sys, json, statistics as st
 res, dur, out, runs, cpus = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+http_dir, http_rate = sys.argv[6], sys.argv[7]
 HZ = 100.0
 def fbytes(size): return 358.0 if size == "imix" else int(size) + 42.0
 data, fails, order = {}, {}, []
@@ -264,6 +295,46 @@ for key in order:
         d = 100.0 * (g["us_per_pkt"] - n["us_per_pkt"]) / g["us_per_pkt"]
         summary["%s@%d" % key]["native_cpu_saving_pct"] = d
         print("payload %-5s %.2fM pps (%.1f Gbit/s): native costs %.0f%% less CPU per dropped packet" % (key[0], key[1] / 1e6, n["gbps"], d))
+# ---- genuine web requests made while the flood ran --------------------------------
+if http_dir:
+    import glob, os
+    pooled = {}                    # (size, rate, mode, phase) -> [requests]
+    for fpath in glob.glob(os.path.join(http_dir, "*.json")):
+        size, rate, _run, mode, phase = os.path.basename(fpath)[:-5].split("_")
+        pooled.setdefault((size, int(rate), mode, phase), []).extend(json.load(open(fpath))["results"])
+    def pct(vals, q):
+        if not vals: return float("nan")
+        v = sorted(vals); return v[min(len(v) - 1, max(0, int(round(q / 100.0 * len(v) + 0.5)) - 1))]
+    def stats(rows, key):
+        v = [r[key] for r in rows if r["ok"] and r[key] is not None]
+        return [pct(v, 50), pct(v, 90), pct(v, 99), max(v) if v else float("nan")]
+    print()
+    print("HTTP fetch of a 512 KiB page through the same NIC, %s requests/s, pooled over the runs (milliseconds)" % http_rate)
+    print("'idle' = same VM and mode with no flood; 'flood' = while the flood ran. TTFB = time to first byte of")
+    print("the response, counted from the start of the connection; 'failed' = reset, timed out or incomplete.")
+    print("%-7s %-8s %-8s %-6s %9s | %-34s | %-34s" % ("payload", "offered", "mode", "state", "failed", "TTFB  p50    p90    p99    max", "total p50    p90    p99    max"))
+    httpsum = {}
+    for key in order:
+        size, rate = key
+        for m in ("generic", "native"):
+            for phase, label in (("idle", "idle"), ("load", "flood")):
+                rows = pooled.get((size, rate, m, phase))
+                if not rows: continue
+                bad = sum(1 for r in rows if not r["ok"])
+                t, tot = stats(rows, "ttfb_ms"), stats(rows, "total_ms")
+                httpsum["%s@%d/%s/%s" % (size, rate, m, label)] = {"requests": len(rows), "failed": bad,
+                    "ttfb_ms": dict(zip(("p50", "p90", "p99", "max"), t)), "total_ms": dict(zip(("p50", "p90", "p99", "max"), tot))}
+                print("%-7s %-8s %-8s %-6s %4d/%-4d | %9.1f %6.1f %6.1f %6.1f | %9.1f %6.1f %6.1f %6.1f" % (
+                    size, "%.2fM" % (rate / 1e6), m, label, bad, len(rows), *t, *tot))
+    print()
+    for key in order:
+        for m in ("generic", "native"):
+            a_, b_ = httpsum.get("%s@%d/%s/idle" % (*key, m)), httpsum.get("%s@%d/%s/flood" % (*key, m))
+            if a_ and b_ and a_["ttfb_ms"]["p99"] > 0:
+                print("payload %-5s %.2fM pps, %-7s: TTFB p99 %.1f ms idle -> %.1f ms under flood (x%.1f); %d of %d requests failed under flood" % (
+                    key[0], key[1] / 1e6, m, a_["ttfb_ms"]["p99"], b_["ttfb_ms"]["p99"], b_["ttfb_ms"]["p99"] / a_["ttfb_ms"]["p99"], b_["failed"], b_["requests"]))
+    summary["http"] = httpsum
+
 if out:
     json.dump(summary, open(out, "w"), indent=1); print("wrote", out)
 PY

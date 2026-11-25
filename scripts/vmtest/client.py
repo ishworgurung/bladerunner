@@ -17,12 +17,15 @@ Examples
   # an 8-second flood at 20000 packets per second
   client.py ... --duration 8 --rate 20000 --size 300
 """
+
 import argparse
 import socket
 import struct
 import sys
 import threading
 import time
+
+from httpload import HttpLoad, Link
 
 
 def mac(s):
@@ -34,7 +37,7 @@ def csum(data):
     """Internet checksum (RFC 1071) over data."""
     if len(data) % 2:
         data += b"\0"
-    s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    s = sum(struct.unpack(f"!{len(data) // 2}H", data))
     while s >> 16:
         s = (s & 0xFFFF) + (s >> 16)
     return ~s & 0xFFFF
@@ -47,8 +50,19 @@ def build_frame(a):
     # UDP checksum 0 means "not computed", which is valid for IPv4.
     udp = struct.pack("!HHHH", a.sport, a.dport, udp_len, 0) + payload
     total = 20 + len(udp)
-    ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, 0x1234, 0, a.ttl, 17, 0,
-                     socket.inet_aton(a.src_ip), socket.inet_aton(a.dst_ip))
+    ip = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45,
+        0,
+        total,
+        0x1234,
+        0,
+        a.ttl,
+        17,
+        0,
+        socket.inet_aton(a.src_ip),
+        socket.inet_aton(a.dst_ip),
+    )
     ip = ip[:10] + struct.pack("!H", csum(ip)) + ip[12:]
     eth = mac(a.dst_mac) + mac(a.src_mac) + b"\x08\x00"
     return eth + ip + udp
@@ -61,6 +75,9 @@ def connect(port, timeout=30):
         try:
             s = socket.create_connection(("127.0.0.1", port), timeout=5)
             s.settimeout(None)
+            # Small frames (ARP, ACKs, SYNs) must go out at once, not wait to be batched
+            # (Nagle), or the link itself would add tens of milliseconds to every exchange.
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             return s
         except OSError:
             if time.time() > end:
@@ -92,9 +109,46 @@ def wire_for(a, payload):
 
 
 def serve(a):
-    """Hold one connection open and flood on command (see --serve)."""
-    s = connect(a.port)
-    threading.Thread(target=drain, args=(s,), daemon=True).start()
+    """Hold one connection open and run commands from stdin (see --serve).
+
+    Commands (one per line; each runs in its own thread, so a flood and an HTTP
+    test can run at the same time, which is the point):
+      FLOOD <pps> <seconds> <payload-bytes|imix> <settle-seconds> [<chunk-packets>]
+          replies "sent <count>". A chunk size above 0 sends in small pieces, so the
+          HTTP frames interleave with the flood instead of queueing behind a burst.
+      HTTP <requests-per-second> <seconds> <delay-seconds> <result-file>
+          fetches a page through the same NIC, starting after <delay>; replies "http done".
+      QUIT
+    """
+    sys.setswitchinterval(0.0005)  # let the HTTP threads run promptly beside the flood
+    sock = connect(a.port)
+    link = Link(sock, a.src_mac, a.http_ip, a.dst_mac, a.dst_ip)
+    threading.Thread(target=link.rx_loop, daemon=True).start()
+    http = HttpLoad(link)
+    out_lock = threading.Lock()
+
+    def reply(text):
+        with out_lock:
+            print(text, flush=True)
+
+    def flood(rate, secs, payload, settle, chunk):
+        wire, per = wire_for(a, payload)
+        blocks = max(1, int((chunk if chunk > 0 else rate // 100) // per))
+        piece = wire * blocks
+        sent, t0 = 0, time.time()
+        while time.time() < t0 + secs:
+            link.send_raw(piece)
+            sent += blocks * per
+            ahead = sent / rate - (time.time() - t0)
+            if ahead > 0:
+                time.sleep(ahead)
+        time.sleep(settle)  # let the guest drain its backlog before the next step
+        reply(f"sent {sent}")
+
+    def web(rate, secs, delay, outfile):
+        http.run(rate, secs, delay, outfile)
+        reply("http done")
+
     print("ready", flush=True)
     for line in sys.stdin:
         w = line.split()
@@ -102,29 +156,34 @@ def serve(a):
             continue
         if w[0] == "QUIT":
             break
-        if w[0] != "FLOOD" or len(w) != 5:
-            print("error bad command", flush=True)
-            continue
-        rate, secs, payload, settle = float(w[1]), float(w[2]), w[3], float(w[4])
-        wire, per = wire_for(a, payload)
-        batch = max(1, int(rate // 100 // per))
-        sent, t0 = 0, time.time()
-        while time.time() < t0 + secs:
-            s.sendall(wire * batch)
-            sent += batch * per
-            ahead = sent / rate - (time.time() - t0)
-            if ahead > 0:
-                time.sleep(ahead)
-        time.sleep(settle)          # let the guest drain its backlog before the next step
-        print("sent", sent, flush=True)
-    s.shutdown(socket.SHUT_WR)
+        try:
+            if w[0] == "FLOOD" and len(w) in (5, 6):
+                args = (
+                    float(w[1]),
+                    float(w[2]),
+                    w[3],
+                    float(w[4]),
+                    int(w[5]) if len(w) == 6 else 0,
+                )
+                threading.Thread(target=flood, args=args, daemon=True).start()
+            elif w[0] == "HTTP" and len(w) == 5:
+                args = (float(w[1]), float(w[2]), float(w[3]), w[4])
+                threading.Thread(target=web, args=args, daemon=True).start()
+            else:
+                reply("error bad command")
+        except ValueError:
+            reply("error bad command")
+    time.sleep(0.5)
+    sock.shutdown(socket.SHUT_WR)
     time.sleep(0.2)
-    s.close()
+    sock.close()
     return 0
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--port", type=int, required=True, help="QEMU stream socket port")
     p.add_argument("--dst-mac", required=True)
     p.add_argument("--src-mac", default="02:00:00:00:00:01")
@@ -133,22 +192,38 @@ def main():
     p.add_argument("--sport", type=int, default=40000)
     p.add_argument("--dport", type=int, default=19999)
     p.add_argument("--size", type=int, default=20, help="UDP payload bytes")
-    p.add_argument("--imix", action="store_true",
-                   help="send the standard Internet mix instead of --size: 7 parts 64-byte, 4 parts "
-                        "594-byte and 1 part 1518-byte Ethernet frames (UDP payloads of 18, 548 and 1472 bytes)")
+    p.add_argument(
+        "--imix",
+        action="store_true",
+        help="send the standard Internet mix instead of --size: 7 parts 64-byte, 4 parts "
+        "594-byte and 1 part 1518-byte Ethernet frames (UDP payloads of 18, 548 and 1472 bytes)",
+    )
     p.add_argument("--ttl", type=int, default=64)
     p.add_argument("--count", type=int, help="send exactly N packets")
     p.add_argument("--pace", type=float, default=0.0, help="seconds between packets (with --count)")
     p.add_argument("--duration", type=float, help="send for N seconds (needs --rate)")
     p.add_argument("--rate", type=float, help="packets per second (with --duration)")
-    p.add_argument("--serve", action="store_true",
-                   help="stay connected and run commands read from stdin, one per line: "
-                        "'FLOOD <pps> <seconds> <payload-bytes|imix> <settle-seconds>' prints the packet count "
-                        "when done; 'QUIT' disconnects. Used by scripts/vmbench.sh, which must never drop the "
-                        "connection mid-run (QEMU 11.x crashes when it flushes queued packets to a closed stream)")
-    p.add_argument("--linger", type=float, default=0.2,
-                   help="seconds to keep the connection open after the last packet, so the VM can drain "
-                        "its backlog before QEMU sees the disconnect (use a few seconds after heavy floods)")
+    p.add_argument(
+        "--serve",
+        action="store_true",
+        help="stay connected and run commands read from stdin, one per line: "
+        "'FLOOD <pps> <seconds> <payload-bytes|imix> <settle-seconds> [<chunk>]' prints the packet "
+        "count when done, 'HTTP <rps> <seconds> <delay> <file>' fetches pages through the same NIC, "
+        "'QUIT' disconnects. Used by scripts/vmbench.sh, which must never drop the "
+        "connection mid-run (QEMU 11.x crashes when it flushes queued packets to a closed stream)",
+    )
+    p.add_argument(
+        "--http-ip",
+        default="10.77.0.60",
+        help="source address of the HTTP test client in --serve mode (must not be blocklisted)",
+    )
+    p.add_argument(
+        "--linger",
+        type=float,
+        default=0.2,
+        help="seconds to keep the connection open after the last packet, so the VM can drain "
+        "its backlog before QEMU sees the disconnect (use a few seconds after heavy floods)",
+    )
     a = p.parse_args()
     if a.serve:
         return serve(a)
